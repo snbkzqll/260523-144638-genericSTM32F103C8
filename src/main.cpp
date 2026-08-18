@@ -1,6 +1,6 @@
 // 硬件版本：USB 电压电流表
-// 软件版本：3.2 (修复电流采样与MOS状态，恢复原版精准度)
-// 编写时间：2026-08-18
+// 软件版本：3.8 (纠正电流算法回归原版 505 标定 + 两点电压线性校准 V-Offset)
+// 编写时间：2026-08-19
 // MCU：STM32F103C8T6
 
 #include <Arduino.h>
@@ -21,11 +21,11 @@ const byte PIN_NTC_IN  = PA4; // NTC 温度采样 (ADC1_IN4)
 const byte PIN_VOLT_IN = PA5; // 输入总电压采样 (ADC1_IN5)
 
 const byte PIN_K1 = PA15;     // 按键 1：切页
-const byte PIN_K2 = PB4;      // 按键 2：切组 (短按) / 清零当前组 (长按)
-const byte PIN_K3 = PB10;     // 按键 3：旋转屏幕 (短按) / 强制保存 (长按)
-const byte PIN_K4 = PB1;      // 按键 4：波形通道切换 (电压波形 / 电流波形)
+const byte PIN_K2 = PB4;      // 按键 2：切组 / 菜单项调节 [-] (支持长按连发)
+const byte PIN_K3 = PB10;     // 按键 3：旋转屏幕 / 菜单项调节 [+] (支持长按连发)
+const byte PIN_K4 = PB1;      // 按键 4：示波器波形源切换 / 设置项光标切换
 
-const byte PIN_M1 = PB9;      // 大电流通道 MOS 控制 (常开 HIGH，保证回路无损导通)
+const byte PIN_M1 = PB9;      // 大电流通道 MOS 控制 (常开 HIGH)
 const byte PIN_M2 = PB8;      // 小电流通道 MOS 控制 (常关 LOW)
 
 // AT24Cxx 外部 EEPROM I2C 地址
@@ -42,17 +42,22 @@ struct DataGroup {
 };
 
 struct SystemConfig {
-  uint32_t magic;      // Flash / EEPROM 保存魔数校验
-  uint8_t activeGroup; // 当前激活的数据组 (0 ~ 3)
-  uint8_t screenRot;   // 屏幕旋转 (0: 0度, 2: 180度)
-  uint8_t waveMode;    // 示波器波形源 (0: 电压波形, 1: 电流波形)
+  uint32_t magic;         // 校验魔数
+  uint8_t activeGroup;    // 当前激活的数据组 (0 ~ 3)
+  uint8_t screenRot;      // 屏幕旋转 (0: 0度, 2: 180度)
+  uint8_t waveMode;       // 示波器波形源 (0: 电压波形, 1: 电流波形)
+  uint8_t brightness;     // OLED 亮度对比度 (0 ~ 255)
+  float voltCoeff;        // 电压斜率校准系数 (标准默认 12.01f)
+  float voltOffset;       // 电压零点偏置补偿 (标准默认 0.00f，用于吸收二极管压降)
+  float currCoeff;        // 电流分母系数 (标准默认 505.0f，即 101 * 5)
+  uint8_t sleepMin;       // 自动熄屏时间(0:常开, 1:1min, 2:2min, 3:3min, 5:5min, 10:10min)
 };
 
-const uint32_t FLASH_MAGIC = 0x55AA2026;
+const uint32_t STORAGE_MAGIC = 0x55AA2032;
 const uint32_t FLASH_PAGE_ADDRESS = 0x0800FC00; // STM32F103 内部 Flash Page 63
 
 DataGroup groups[4];
-SystemConfig sysCfg = { FLASH_MAGIC, 0, 0, 0 };
+SystemConfig sysCfg = { STORAGE_MAGIC, 0, 0, 0, 160, 12.01f, 0.00f, 505.0f, 2 };
 
 // ---------------------- 全局测量变量 ----------------------
 float V = 0.0f;       // 输入总电压 (V)
@@ -63,54 +68,80 @@ float VP = 0.0f;      // D+ 电压 (V)
 float VN = 0.0f;      // D- 电压 (V)
 float TempC = 0.0f;   // NTC 摄氏温度 (°C)
 
-uint8_t currentPage = 0;   // 当前视图 (0: 主仪表, 1: 快充/网格, 2: 示波器, 3: 能量统计, 4: 设置)
+uint8_t currentPage = 0;   // 当前视图 (0: 主仪表, 1: 快充/网格, 2: 示波器, 3: 能量统计, 4: 设置与校准)
+uint8_t settingItem = 0;   // 设置页面光标索引 (0: 亮度, 1: V-Cal, 2: V-Off, 3: I-Cal, 4: Sleep, 5: CableR)
 
-// 波形环形缓冲区 (记录 60 个历史采样点)
+// 线阻测试临时变量
+float cableV0 = 0.0f;
+float cableR = 0.0f;
+bool cableV0Locked = false;
+
+// 息屏与休眠状态
+bool isScreenSleeping = false;
+uint32_t lastActivityMs = 0;
+
+// 波形环形缓冲区 (60点)
 const uint8_t WAVE_BUF_SIZE = 60;
 float waveBuf[WAVE_BUF_SIZE];
 uint8_t waveIndex = 0;
 
-// 计时与脉冲控制
+// 计时与状态
 uint32_t lastSecondMs = 0;
 uint32_t lastAutoSaveMs = 0;
 uint32_t lastSerialMs = 0;
 bool heartbeatState = false;
 bool eepromDetected = false;
 
-// ---------------------- AT24Cxx 优化版分页 I2C EEPROM 驱动 ----------------------
-// 页写入 (每次写入最多 8 字节，避免大循环卡顿)
-void writeEEPROM_Page(uint16_t addr, const uint8_t *pData, uint8_t len) {
+// ---------------------- OLED 亮度与休眠控制 ----------------------
+void setOledBrightness(uint8_t contrast) {
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command(contrast);
+}
+
+void sleepScreen() {
+  if (!isScreenSleeping) {
+    isScreenSleeping = true;
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+  }
+}
+
+void wakeUpScreen() {
+  if (isScreenSleeping) {
+    isScreenSleeping = false;
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    setOledBrightness(sysCfg.brightness);
+    lastActivityMs = millis();
+  }
+}
+
+// ---------------------- AT24Cxx 驱动函数 ----------------------
+void writeEEPROM_Byte(uint16_t addr, uint8_t data) {
   Wire.beginTransmission(AT24C_I2C_ADDR);
   Wire.write((uint8_t)(addr & 0xFF));
-  for (uint8_t i = 0; i < len; i++) {
-    Wire.write(pData[i]);
-  }
+  Wire.write(data);
   Wire.endTransmission();
-  delay(5); // 仅需等待一次 5ms 页写入周期
+  delay(5);
+}
+
+uint8_t readEEPROM_Byte(uint16_t addr) {
+  uint8_t data = 0xFF;
+  Wire.beginTransmission(AT24C_I2C_ADDR);
+  Wire.write((uint8_t)(addr & 0xFF));
+  Wire.endTransmission();
+  Wire.requestFrom((int)AT24C_I2C_ADDR, 1);
+  if (Wire.available()) data = Wire.read();
+  return data;
 }
 
 void writeEEPROM_Buffer(uint16_t addr, const uint8_t *pData, uint16_t len) {
-  uint16_t offset = 0;
-  while (len > 0) {
-    uint8_t chunk = (len > 8) ? 8 : len;
-    writeEEPROM_Page(addr + offset, pData + offset, chunk);
-    offset += chunk;
-    len -= chunk;
+  for (uint16_t i = 0; i < len; i++) {
+    writeEEPROM_Byte(addr + i, pData[i]);
   }
 }
 
 void readEEPROM_Buffer(uint16_t addr, uint8_t *pData, uint16_t len) {
-  Wire.beginTransmission(AT24C_I2C_ADDR);
-  Wire.write((uint8_t)(addr & 0xFF));
-  Wire.endTransmission();
-  
-  uint16_t readLen = 0;
-  while (readLen < len) {
-    uint8_t chunk = (len - readLen > 32) ? 32 : (len - readLen);
-    Wire.requestFrom((int)AT24C_I2C_ADDR, (int)chunk);
-    for (uint8_t i = 0; i < chunk && Wire.available(); i++) {
-      pData[readLen++] = Wire.read();
-    }
+  for (uint16_t i = 0; i < len; i++) {
+    pData[i] = readEEPROM_Byte(addr + i);
   }
 }
 
@@ -119,7 +150,7 @@ bool checkEEPROM() {
   return (Wire.endTransmission() == 0);
 }
 
-// ---------------------- 内部 Flash 模拟擦写 (备用降级方案) ----------------------
+// ---------------------- 内部 Flash 模拟擦写 ----------------------
 void saveFlashBackup() {
   HAL_FLASH_Unlock();
   FLASH_EraseInitTypeDef EraseInitStruct;
@@ -145,14 +176,14 @@ void saveFlashBackup() {
   HAL_FLASH_Lock();
 }
 
-// ---------------------- 数据加载与自动保存 ----------------------
+// ---------------------- 数据加载与双重备份保存 ----------------------
 void loadAllData() {
   eepromDetected = checkEEPROM();
   bool loaded = false;
 
   if (eepromDetected) {
     readEEPROM_Buffer(0, (uint8_t *)&sysCfg, sizeof(SystemConfig));
-    if (sysCfg.magic == FLASH_MAGIC) {
+    if (sysCfg.magic == STORAGE_MAGIC) {
       readEEPROM_Buffer(sizeof(SystemConfig), (uint8_t *)groups, sizeof(groups));
       loaded = true;
     }
@@ -160,26 +191,36 @@ void loadAllData() {
 
   if (!loaded) {
     uint32_t *pFlash = (uint32_t *)FLASH_PAGE_ADDRESS;
-    if (*pFlash == FLASH_MAGIC) {
+    if (*pFlash == STORAGE_MAGIC) {
       memcpy(&sysCfg, (void *)FLASH_PAGE_ADDRESS, sizeof(SystemConfig));
       memcpy(groups, (void *)(FLASH_PAGE_ADDRESS + sizeof(SystemConfig)), sizeof(groups));
-    } else {
-      sysCfg.magic = FLASH_MAGIC;
-      sysCfg.activeGroup = 0;
-      sysCfg.screenRot = 0;
-      sysCfg.waveMode = 0;
-      memset(groups, 0, sizeof(groups));
+      loaded = true;
     }
+  }
+
+  if (!loaded) {
+    sysCfg.magic = STORAGE_MAGIC;
+    sysCfg.activeGroup = 0;
+    sysCfg.screenRot = 0;
+    sysCfg.waveMode = 0;
+    sysCfg.brightness = 160;
+    sysCfg.voltCoeff = 12.01f;
+    sysCfg.voltOffset = 0.00f;
+    sysCfg.currCoeff = 505.0f;
+    sysCfg.sleepMin = 2;
+    memset(groups, 0, sizeof(groups));
   }
 }
 
 void saveAllData() {
+  sysCfg.magic = STORAGE_MAGIC;
+  
   if (eepromDetected) {
     writeEEPROM_Buffer(0, (const uint8_t *)&sysCfg, sizeof(SystemConfig));
     writeEEPROM_Buffer(sizeof(SystemConfig), (const uint8_t *)groups, sizeof(groups));
-  } else {
-    saveFlashBackup();
   }
+  
+  saveFlashBackup();
 }
 
 // ---------------------- 快充协议检测 ----------------------
@@ -190,11 +231,21 @@ const char* getProtocolName() {
   if (VP >= 1.80f && VP <= 2.30f && VN >= 2.40f && VN <= 2.90f) return "Apple 2.1A";
   if (VP >= 2.40f && VP <= 2.90f && VN >= 1.80f && VN <= 2.30f) return "Apple 1.0A";
   if (fabs(VP - VN) < 0.15f && VP < 1.20f && VP > 0.10f)        return "DCP 1.5A";
-  if (VP < 0.30f && VN < 0.30f)                                return "Std USB 5V";
-  return "Unknown/PD";
+  if (VP < 0.20f && VN < 0.20f)                                return "DIRECT (No-QC)";
+  return "UNKNOWN";
 }
 
-// ---------------------- ADC 采样与滤波 (100% 忠实原版精准算法) ----------------------
+const char* getShortProtocolName() {
+  if (VP >= 0.40f && VP <= 0.85f && VN >= 0.40f && VN <= 0.85f) return "QC3.0";
+  if (VP >= 2.80f && VP <= 3.60f && VN >= 0.40f && VN <= 0.85f) return "QC2.0";
+  if (VP >= 2.40f && VP <= 2.90f && VN >= 2.40f && VN <= 2.90f) return "Apple";
+  if (VP >= 1.80f && VP <= 2.30f && VN >= 2.40f && VN <= 2.90f) return "Apple";
+  if (fabs(VP - VN) < 0.15f && VP < 1.20f && VP > 0.10f)        return "DCP";
+  if (VP < 0.20f && VN < 0.20f)                                return "DIRECT";
+  return "LIVE";
+}
+
+// ---------------------- ADC 采样与数据滤波 (严格基于原作者 505 与两点校准) ----------------------
 void doSampling() {
   // 1. D+/D- 电压 (PA0 / PA3)
   float vnRaw = map(analogRead(PIN_VOLT_DN), 0, 4095, 0, 3300);
@@ -202,19 +253,19 @@ void doSampling() {
   float vpRaw = map(analogRead(PIN_VOLT_DP), 0, 4095, 0, 3300);
   VP = (vpRaw * 2.0f) / 1000.0f;
 
-  // 2. 总电压 V (PA5，50 次均值滤波，分压比 12.01)
+  // 2. 总电压 V (PA5，50次均值滤波，支持斜率 voltCoeff 与 偏置 voltOffset)
   float sumV = 0;
   for (byte i = 0; i < 50; i++) {
-    float vRaw = map(analogRead(PIN_VOLT_IN), 0, 4095, 0, 3300);
-    sumV += (vRaw * 12.01f) / 1000.0f;
+    float vMv = map(analogRead(PIN_VOLT_IN), 0, 4095, 0, 3300);
+    sumV += (vMv * sysCfg.voltCoeff) / 1000.0f;
   }
-  V = sumV / 50.0f;
+  V = (sumV / 50.0f) + sysCfg.voltOffset;
 
-  // 3. 电流 A (PA1，50 次均值滤波，忠实采用原工程公式 a / 101 / 5)
+  // 3. 电流 A (PA1，50次均值滤波，严格采用标准公式: aMv / 505.0)
   float sumA = 0;
   for (byte i = 0; i < 50; i++) {
-    float aRaw = map(analogRead(PIN_CURR_HI), 0, 4095, 0, 3300);
-    sumA += aRaw / 101.0f / 5.0f;
+    float aMv = map(analogRead(PIN_CURR_HI), 0, 4095, 0, 3300);
+    sumA += aMv / sysCfg.currCoeff; // 默认 sysCfg.currCoeff = 505.0f (即 101 * 5)
   }
   A = sumA / 50.0f;
 
@@ -227,20 +278,20 @@ void doSampling() {
   }
 
   // 5. NTC 摄氏度计算 (PA4)
-  float ntcRaw = map(analogRead(PIN_NTC_IN), 0, 4095, 0, 3300);
-  if (3300.0f - ntcRaw > 1.0f) {
-    float rNtc = (10000.0f * ntcRaw) / (3300.0f - ntcRaw);
+  float ntcMv = map(analogRead(PIN_NTC_IN), 0, 4095, 0, 3300);
+  if (3300.0f - ntcMv > 10.0f) {
+    float rNtc = (10000.0f * ntcMv) / (3300.0f - ntcMv);
     TempC = (3950.0f * 298.15f) / (3950.0f + (298.15f * log(rNtc / 10000.0f))) - 273.15f - 2.0f;
   }
 
-  // 更新当前组极值 (Peak Holds)
+  // 6. 更新当前组极值
   DataGroup &g = groups[sysCfg.activeGroup];
   if (V > g.vMax) g.vMax = V;
   if (A > g.aMax) g.aMax = A;
   if (W > g.wMax) g.wMax = W;
 }
 
-// ---------------------- 1秒定时积分与电量更新 ----------------------
+// ---------------------- 1秒定时积分与自动息屏检测 ----------------------
 void updateEnergyAndTimer() {
   if (millis() - lastSecondMs >= 1000) {
     lastSecondMs = millis();
@@ -251,68 +302,159 @@ void updateEnergyAndTimer() {
     g.mWh += (W * 1000.0f) / 3600.0f;
     g.mAh += (A * 1000.0f) / 3600.0f;
 
-    // 波形记录
     waveBuf[waveIndex] = (sysCfg.waveMode == 0) ? V : A;
     waveIndex = (waveIndex + 1) % WAVE_BUF_SIZE;
+
+    if (sysCfg.sleepMin > 0 && !isScreenSleeping) {
+      if (millis() - lastActivityMs >= ((uint32_t)sysCfg.sleepMin * 60000UL)) {
+        sleepScreen();
+      }
+    }
   }
 
-  // 后台 5 秒自动无感保存
   if (millis() - lastAutoSaveMs >= 5000) {
     lastAutoSaveMs = millis();
     saveAllData();
   }
 }
 
-// ---------------------- 按键检测与事件 ----------------------
+// ---------------------- 设置项加减核心逻辑 ----------------------
+void applySettingChange(bool increase) {
+  if (settingItem == 0) { // 亮度
+    if (increase) {
+      if (sysCfg.brightness <= 225) sysCfg.brightness += 30;
+    } else {
+      if (sysCfg.brightness > 30) sysCfg.brightness -= 30;
+    }
+    setOledBrightness(sysCfg.brightness);
+  } else if (settingItem == 1) { // 电压斜率微调 (0.02 步进)
+    if (increase) sysCfg.voltCoeff += 0.02f;
+    else          sysCfg.voltCoeff -= 0.02f;
+  } else if (settingItem == 2) { // 电压零点偏置微调 (0.02V 步进，解决二极管压降)
+    if (increase) sysCfg.voltOffset += 0.02f;
+    else          sysCfg.voltOffset -= 0.02f;
+  } else if (settingItem == 3) { // 电流系数微调 (2.0 步进)
+    if (increase) sysCfg.currCoeff += 2.0f;
+    else          sysCfg.currCoeff -= 2.0f;
+  } else if (settingItem == 4) { // 熄屏时间 (OFF -> 1min -> 2min -> 3min -> 5min -> 10min -> OFF)
+    if (increase) {
+      if (sysCfg.sleepMin == 0) sysCfg.sleepMin = 1;
+      else if (sysCfg.sleepMin == 1) sysCfg.sleepMin = 2;
+      else if (sysCfg.sleepMin == 2) sysCfg.sleepMin = 3;
+      else if (sysCfg.sleepMin == 3) sysCfg.sleepMin = 5;
+      else if (sysCfg.sleepMin == 5) sysCfg.sleepMin = 10;
+      else sysCfg.sleepMin = 0;
+    } else {
+      if (sysCfg.sleepMin == 0) sysCfg.sleepMin = 10;
+      else if (sysCfg.sleepMin == 10) sysCfg.sleepMin = 5;
+      else if (sysCfg.sleepMin == 5) sysCfg.sleepMin = 3;
+      else if (sysCfg.sleepMin == 3) sysCfg.sleepMin = 2;
+      else if (sysCfg.sleepMin == 2) sysCfg.sleepMin = 1;
+      else sysCfg.sleepMin = 0;
+    }
+  } else if (settingItem == 5) { // 线阻测试
+    if (!increase) {
+      cableV0 = V;
+      cableV0Locked = true;
+    } else {
+      if (cableV0Locked && A > 0.15f && cableV0 > V) {
+        cableR = ((cableV0 - V) / A) * 1000.0f;
+      }
+    }
+  }
+
+  saveAllData();
+}
+
+// ---------------------- 按键检测与长按极速连发 ----------------------
 struct KeyState {
   byte pin;
   bool lastState;
   uint32_t pressTime;
+  uint32_t lastRepeatTime;
   bool longPressed;
+  bool isRepeating;
 };
 
 KeyState keys[4] = {
-  { PIN_K1, HIGH, 0, false },
-  { PIN_K2, HIGH, 0, false },
-  { PIN_K3, HIGH, 0, false },
-  { PIN_K4, HIGH, 0, false }
+  { PIN_K1, HIGH, 0, 0, false, false },
+  { PIN_K2, HIGH, 0, 0, false, false },
+  { PIN_K3, HIGH, 0, 0, false, false },
+  { PIN_K4, HIGH, 0, 0, false, false }
 };
 
 void handleButtons() {
   for (uint8_t i = 0; i < 4; i++) {
     bool currState = digitalRead(keys[i].pin);
+
+    // 1. 按键按下瞬间
     if (currState == LOW && keys[i].lastState == HIGH) {
-      keys[i].pressTime = millis();
-      keys[i].longPressed = false;
-    } else if (currState == LOW && keys[i].lastState == LOW) {
-      if (!keys[i].longPressed && (millis() - keys[i].pressTime > 1500)) {
+      if (isScreenSleeping) {
+        wakeUpScreen();
+        keys[i].lastState = currState;
+        keys[i].pressTime = millis();
         keys[i].longPressed = true;
-        if (i == 1) { 
-          // K2 长按：清零当前组
-          memset(&groups[sysCfg.activeGroup], 0, sizeof(DataGroup));
-          saveAllData();
-        } else if (i == 2) { 
-          // K3 长按：立即手动保存
-          saveAllData();
+        return;
+      }
+
+      lastActivityMs = millis();
+      keys[i].pressTime = millis();
+      keys[i].lastRepeatTime = millis();
+      keys[i].longPressed = false;
+      keys[i].isRepeating = false;
+    }
+    // 2. 按键保持按住中 (连发/长按)
+    else if (currState == LOW && keys[i].lastState == LOW) {
+      lastActivityMs = millis();
+
+      if (currentPage == 4 && (i == 1 || i == 2) && (settingItem == 1 || settingItem == 2 || settingItem == 3)) {
+        if (millis() - keys[i].pressTime > 400) {
+          keys[i].isRepeating = true;
+          if (millis() - keys[i].lastRepeatTime > 70) {
+            keys[i].lastRepeatTime = millis();
+            applySettingChange(i == 2);
+          }
+        }
+      } else {
+        if (!keys[i].longPressed && (millis() - keys[i].pressTime > 1500)) {
+          keys[i].longPressed = true;
+          if (i == 1) { 
+            memset(&groups[sysCfg.activeGroup], 0, sizeof(DataGroup));
+            saveAllData();
+          } else if (i == 2) { 
+            saveAllData();
+          }
         }
       }
-    } else if (currState == HIGH && keys[i].lastState == LOW) {
-      if (!keys[i].longPressed) {
+    }
+    // 3. 按键释放瞬间 (短按)
+    else if (currState == HIGH && keys[i].lastState == LOW) {
+      lastActivityMs = millis();
+
+      if (!keys[i].longPressed && !keys[i].isRepeating) {
         if (i == 0) {
-          // K1：切页
           currentPage = (currentPage + 1) % 5;
         } else if (i == 1) {
-          // K2：切组 G0 -> G1 -> G2 -> G3
-          sysCfg.activeGroup = (sysCfg.activeGroup + 1) % 4;
+          if (currentPage == 4) {
+            applySettingChange(false);
+          } else {
+            sysCfg.activeGroup = (sysCfg.activeGroup + 1) % 4;
+          }
         } else if (i == 2) {
-          // K3：旋转屏幕 180°
-          sysCfg.screenRot = (sysCfg.screenRot == 0) ? 2 : 0;
-          display.setRotation(sysCfg.screenRot);
-          saveAllData();
+          if (currentPage == 4) {
+            applySettingChange(true);
+          } else {
+            sysCfg.screenRot = (sysCfg.screenRot == 0) ? 2 : 0;
+            display.setRotation(sysCfg.screenRot);
+            saveAllData();
+          }
         } else if (i == 3) {
-          // K4：切换示波器波形源 (电压曲线 <-> 电流曲线)
-          sysCfg.waveMode = (sysCfg.waveMode == 0) ? 1 : 0;
-          saveAllData();
+          if (currentPage == 4) {
+            settingItem = (settingItem + 1) % 6;
+          } else {
+            sysCfg.waveMode = (sysCfg.waveMode == 0) ? 1 : 0;
+            saveAllData();
+          }
         }
       }
     }
@@ -345,7 +487,6 @@ void handleSerialLog() {
 // =========================================================================
 
 void drawHeader() {
-  // 数据组标签 [G0]
   display.fillRect(0, 0, 22, 9, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK);
   display.setTextSize(1);
@@ -353,7 +494,6 @@ void drawHeader() {
   display.print("G");
   display.print(sysCfg.activeGroup);
 
-  // 心跳指示点 ●
   display.setTextColor(SSD1306_WHITE);
   if (heartbeatState) {
     display.fillCircle(28, 4, 2, SSD1306_WHITE);
@@ -361,11 +501,9 @@ void drawHeader() {
     display.drawCircle(28, 4, 2, SSD1306_WHITE);
   }
 
-  // 状态指示
   display.setCursor(35, 1);
-  display.print("LIVE");
+  display.print(getShortProtocolName());
 
-  // NTC 温度
   display.setCursor(85, 1);
   display.print(TempC, 1);
   display.print("C");
@@ -373,21 +511,17 @@ void drawHeader() {
   display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
 }
 
-// Page 0: 赛博主仪表盘 View
 void drawPage0_Main() {
   drawHeader();
 
-  // 电压卡片 (左上角)
   display.drawRoundRect(0, 13, 62, 33, 3, SSD1306_WHITE);
   display.setCursor(4, 16); display.setTextSize(1); display.print("VOLT");
   display.setCursor(4, 27); display.setTextSize(2); display.print(V, 2);
 
-  // 电流卡片 (右上角)
   display.drawRoundRect(65, 13, 63, 33, 3, SSD1306_WHITE);
   display.setCursor(69, 16); display.setTextSize(1); display.print("CURR");
   display.setCursor(69, 27); display.setTextSize(2); display.print(A, 2);
 
-  // 底部状态栏卡片 (功率 / 电量)
   display.drawRoundRect(0, 48, 128, 16, 2, SSD1306_WHITE);
   display.setTextSize(1);
   display.setCursor(4, 52); display.print("P:"); display.print(W, 1); display.print("W");
@@ -396,7 +530,6 @@ void drawPage0_Main() {
   display.setCursor(65, 52); display.print(g.mAh, 0); display.print("mAh");
 }
 
-// Page 1: 快充协议与多维网格 View
 void drawPage1_Details() {
   drawHeader();
 
@@ -423,18 +556,15 @@ void drawPage1_Details() {
   display.setCursor(68, 53); display.print("D-:"); display.print(VN, 2); display.print("V");
 }
 
-// Page 2: 示波器波形 View
 void drawPage2_Scope() {
   drawHeader();
 
-  // 网格
   for (uint8_t x = 0; x < 128; x += 16) {
     for (uint8_t y = 12; y < 64; y += 10) {
       display.drawPixel(x, y, SSD1306_WHITE);
     }
   }
 
-  // 极值计算
   float minVal = 999.0f, maxVal = -999.0f;
   for (uint8_t i = 0; i < WAVE_BUF_SIZE; i++) {
     if (waveBuf[i] < minVal) minVal = waveBuf[i];
@@ -442,7 +572,6 @@ void drawPage2_Scope() {
   }
   if (maxVal - minVal < 0.05f) { maxVal = minVal + 0.05f; }
 
-  // 连线绘制
   for (uint8_t i = 0; i < WAVE_BUF_SIZE - 1; i++) {
     uint8_t x1 = i * 2;
     uint8_t x2 = (i + 1) * 2;
@@ -457,7 +586,6 @@ void drawPage2_Scope() {
   display.print("H:"); display.print(maxVal, 2);
 }
 
-// Page 3: 能量统计与极值仪表 View
 void drawPage3_Energy() {
   drawHeader();
 
@@ -474,25 +602,61 @@ void drawPage3_Energy() {
   uint32_t hh = g.seconds / 3600;
   uint32_t mm = (g.seconds % 3600) / 60;
   uint32_t ss = g.seconds % 60;
-  display.setCursor(0, 53); display.print("T: ");
+  display.setCursor(0, 53);
+  display.print("T: ");
   if (hh < 10) display.print("0"); display.print(hh); display.print(":");
   if (mm < 10) display.print("0"); display.print(mm); display.print(":");
   if (ss < 10) display.print("0"); display.print(ss);
 }
 
-// Page 4: HUD 系统设置 View
+// Page 4: 极客设置、亮度、两点校准与线阻菜单 View
 void drawPage4_Settings() {
   drawHeader();
 
   display.setTextSize(1);
-  display.setCursor(0, 14); display.print("> Page: "); display.print(currentPage + 1); display.print("/5");
-  display.setCursor(0, 24); display.print("  Storage: "); display.print(eepromDetected ? "AT24C EEPROM" : "Flash Backup");
-  display.setCursor(0, 34); display.print("  WaveSrc: "); display.print((sysCfg.waveMode == 0) ? "Volt Curve" : "Curr Curve");
-  display.setCursor(0, 44); display.print("  K2 Hold: Clear G"); display.print(sysCfg.activeGroup);
-  display.setCursor(0, 54); display.print("  K4: Switch WaveSrc");
+  
+  // 0. 亮度
+  display.setCursor(0, 12);
+  display.print((settingItem == 0) ? "> Bright: " : "  Bright: ");
+  display.print((uint16_t)(sysCfg.brightness * 100 / 255)); display.print("%");
+
+  // 1. 电压斜率 (V-Scale)
+  display.setCursor(0, 20);
+  display.print((settingItem == 1) ? "> V-Scale:" : "  V-Scale:");
+  display.print(sysCfg.voltCoeff, 2);
+
+  // 2. 电压偏置 (V-Offset，用于补偿二极管压降)
+  display.setCursor(0, 28);
+  display.print((settingItem == 2) ? "> V-Off:  " : "  V-Off:  ");
+  if (sysCfg.voltOffset >= 0) display.print("+");
+  display.print(sysCfg.voltOffset, 2); display.print("V");
+
+  // 3. 电流系数 (I-Cal)
+  display.setCursor(0, 36);
+  display.print((settingItem == 3) ? "> I-Cal:  " : "  I-Cal:  ");
+  display.print(sysCfg.currCoeff, 0);
+
+  // 4. 自动熄屏时间
+  display.setCursor(0, 44);
+  display.print((settingItem == 4) ? "> Sleep:  " : "  Sleep:  ");
+  if (sysCfg.sleepMin == 0) display.print("OFF");
+  else { display.print(sysCfg.sleepMin); display.print("min"); }
+
+  // 5. 数据线线阻测试
+  display.setCursor(0, 52);
+  display.print((settingItem == 5) ? "> CableR: " : "  CableR: ");
+  if (cableR > 0.0f) {
+    display.print(cableR, 0); display.print("mR");
+  } else if (cableV0Locked) {
+    display.print("V0="); display.print(cableV0, 2); display.print("V");
+  } else {
+    display.print("K2:V0 K3:Calc");
+  }
 }
 
 void renderDisplay() {
+  if (isScreenSleeping) return;
+
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
@@ -524,7 +688,6 @@ void setup() {
   pinMode(PIN_K3, INPUT_PULLUP);
   pinMode(PIN_K4, INPUT_PULLUP);
 
-  // 保持 M1 恒定 HIGH，M2 恒定 LOW，确保大电流主测量回路稳定通畅
   pinMode(PIN_M1, OUTPUT);
   pinMode(PIN_M2, OUTPUT);
   digitalWrite(PIN_M1, HIGH);
@@ -536,8 +699,11 @@ void setup() {
 
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.setRotation(sysCfg.screenRot);
+  setOledBrightness(sysCfg.brightness);
   display.clearDisplay();
   display.display();
+
+  lastActivityMs = millis();
 }
 
 void loop() {
