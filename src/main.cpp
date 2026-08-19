@@ -277,11 +277,11 @@ void doSampling() {
     R = 0.0f;
   }
 
-  // 5. NTC 摄氏度计算 (PA4)
+  // 5. NTC 摄氏度计算 (PA4，适配 10k B=3450 热敏电阻)
   float ntcMv = map(analogRead(PIN_NTC_IN), 0, 4095, 0, 3300);
   if (3300.0f - ntcMv > 10.0f) {
     float rNtc = (10000.0f * ntcMv) / (3300.0f - ntcMv);
-    TempC = (3950.0f * 298.15f) / (3950.0f + (298.15f * log(rNtc / 10000.0f))) - 273.15f - 2.0f;
+    TempC = (3450.0f * 298.15f) / (3450.0f + (298.15f * log(rNtc / 10000.0f))) - 273.15f;
   }
 
   // 6. 更新当前组极值
